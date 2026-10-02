@@ -19,14 +19,19 @@ const state = {
   drawMode: false,
   blendTemplate: null,            // 示例携带的拼接配置（切换到拼接模式时取用）
   blend: {
-    segments: [],                 // [{id, scheme:{镜头参数}, u0,u1, min_overlap, clearance, point:{x,y}, lensZ}]
+    segments: [],                 // [{id, scheme:{镜头参数}, u0,u1, min_overlap, clearance, point:{x,y}, lensZ, cal:{base,attMin,attMax}}]
     selectedIdx: 0,
   },
+  cal: { target: 150, tolerance: 10 },   // 融合校准：整幅幕布目标亮度与容差
+  calBands: {},                   // 重叠带采样：{"0": [{u,left,right},…]}，键为左侧设备序号
 };
+
+const DEFAULT_SEG_CAL = { base: 160, attMin: 0.4, attMax: 1.0 };
 
 let result = null;                // 最近一次单机计算结果
 let resultById = {};
 let blendResult = null;           // 最近一次拼接联合计算结果
+let calResult = null;             // 最近一次画面融合校准结果
 let drag = null;                  // 当前拖拽会话
 let examples = [];
 
@@ -104,6 +109,8 @@ function sanitize() {
     }
   } else {
     const sc = s.bottom + s.height / 2;
+    state.cal.target = clamp(state.cal.target, 1, 100000);
+    state.cal.tolerance = clamp(state.cal.tolerance, 0, state.cal.target - 0.01);
     for (const seg of blendSegs()) {
       sanitizeSingleParams(seg.scheme);
       seg.u0 = clamp(seg.u0, -s.width * 0.5, s.width * 1.5);
@@ -111,6 +118,11 @@ function sanitize() {
       seg.min_overlap = clamp(seg.min_overlap, 0, s.width);
       seg.clearance = clamp(seg.clearance, 0, 2);
       seg.lensZ = clamp(seg.lensZ ?? sc, 0, r.height);
+      // 校准测量：基准亮度与可调衰减上下限
+      seg.cal = seg.cal || { ...DEFAULT_SEG_CAL };
+      seg.cal.base = clamp(seg.cal.base, 0.01, 100000);
+      seg.cal.attMin = clamp(seg.cal.attMin, 0, 1);
+      seg.cal.attMax = clamp(seg.cal.attMax, seg.cal.attMin, 1);
       if (seg.point) {
         seg.point.x = clamp(seg.point.x, 0, r.width);
         seg.point.y = clamp(seg.point.y, 0, r.depth);
@@ -119,6 +131,18 @@ function sanitize() {
       const dv = blendDeviceResult(blendSegs().indexOf(seg));
       if (dv && dv.ranges && dv.ranges.z) {
         seg.lensZ = clamp(seg.lensZ, dv.ranges.z[0], dv.ranges.z[1]);
+      }
+    }
+    // 重叠带采样：u 夹到当前带内、亮度非负
+    const segs = blendSegs();
+    for (const [key, samples] of Object.entries(state.calBands)) {
+      const k = Number(key);
+      if (!(k >= 0 && k < segs.length - 1)) { delete state.calBands[key]; continue; }
+      const u0 = segs[k + 1].u0, u1 = segs[k].u1;
+      for (const smp of samples) {
+        smp.u = clamp(smp.u, u0, u1);
+        smp.left = clamp(smp.left, 0, 100000);
+        smp.right = clamp(smp.right, 0, 100000);
       }
     }
   }
@@ -151,6 +175,25 @@ function blendPayload() {
   };
 }
 
+function calibratePayload() {
+  /* 校准请求 = 拼接输入（沿用 /api/blend）+ 目标亮度 + 逐机测量 + 重叠带采样；
+     仅提交当前几何上确实存在的重叠带（其余保留在界面状态中不上送） */
+  const payload = blendPayload();
+  const segs = blendSegs();
+  payload.target = { luminance: state.cal.target, tolerance: state.cal.tolerance };
+  payload.devices = segs.map(seg => ({
+    base_luminance: seg.cal.base, att_min: seg.cal.attMin, att_max: seg.cal.attMax,
+  }));
+  payload.overlaps = [];
+  for (let k = 0; k < segs.length - 1; k++) {
+    if (segs[k].u1 - segs[k + 1].u0 <= 1e-9) continue;
+    const samples = (state.calBands[String(k)] || [])
+      .map(s => ({ u: s.u, left: s.left, right: s.right }));
+    if (samples.length) payload.overlaps.push({ between: [k, k + 1], samples });
+  }
+  return payload;
+}
+
 async function doCompute() {
   const seq = ++computeSeq;
   try {
@@ -168,16 +211,25 @@ async function doCompute() {
       resultById = {};
       for (const s of result.schemes) resultById[s.id] = s;
     } else {
-      const res = await fetch('/api/blend', {
+      const post = (url, body) => fetch(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(blendPayload()),
+        body: JSON.stringify(body),
       });
-      if (!res.ok || seq !== computeSeq) {
-        if (res.status === 400) blendResult = await res.json().catch(() => null);
+      const [resB, resC] = await Promise.all([
+        post('/api/blend', blendPayload()),
+        post('/api/calibrate', calibratePayload()),
+      ]);
+      if (seq !== computeSeq) return;
+      if (!resB.ok) {
+        if (resB.status === 400) blendResult = await resB.json().catch(() => null);
+        if (resC.status === 400) calResult = await resC.json().catch(() => calResult);
         render();
         return;
       }
-      blendResult = await res.json();
+      blendResult = await resB.json();
+      if (resC.ok || resC.status === 400) {
+        calResult = await resC.json().catch(() => calResult);
+      }
       // 初次求解（存在设备尚无安装点）时自动采纳服务器建议点，保持整体状态一致；
       // 用户拖动导致的 joint_conflict 保留用户当前点，由其点击「采纳建议点」
       // 或点击顶视图 × 标记，避免拖动松手后点位跳动。
@@ -209,6 +261,12 @@ function onStateChange() {
 /* ================= 模式切换 / 区间初始化 ================= */
 function makeBlendSegment(template, idx, fallbackScheme) {
   const sc = state.screen.bottom + state.screen.height / 2;
+  const calDev = state.blendTemplate && state.blendTemplate.calibrate &&
+                 state.blendTemplate.calibrate.devices
+    ? state.blendTemplate.calibrate.devices[idx] : null;
+  const cal = calDev
+    ? { base: calDev.base_luminance, attMin: calDev.att_min, attMax: calDev.att_max }
+    : { ...DEFAULT_SEG_CAL };
   if (template) {
     const src = state.schemes[template.scheme_idx] || fallbackScheme;
     return {
@@ -217,14 +275,14 @@ function makeBlendSegment(template, idx, fallbackScheme) {
       u0: template.u0, u1: template.u1,
       min_overlap: template.min_overlap ?? 0.2,
       clearance: template.clearance ?? 0.3,
-      point: null, lensZ: sc,
+      point: null, lensZ: sc, cal,
     };
   }
   return {
     id: uid(),
     scheme: { name: `${idx + 1}号机`, ...sanitizeClone(fallbackScheme) },
     u0: 0, u1: 0, min_overlap: 0.2, clearance: 0.3,
-    point: null, lensZ: sc,
+    point: null, lensZ: sc, cal,
   };
 }
 
@@ -263,6 +321,10 @@ function splitSegmentsEven(n) {
   }
   state.blend.segments = segs;
   state.blend.selectedIdx = clamp(state.blend.selectedIdx, 0, n - 1);
+  // 台数变化后仅保留仍然有效的重叠带采样（键为左侧设备序号）
+  for (const key of Object.keys(state.calBands)) {
+    if (Number(key) >= n - 1) delete state.calBands[key];
+  }
 }
 
 function enterBlendMode() {
@@ -279,6 +341,19 @@ function enterBlendMode() {
     });
     state.blend.segments = segs;
     state.blend.selectedIdx = 0;
+    // 示例携带的校准测量：目标亮度/容差、各机基准与衰减范围、重叠带采样
+    const tc = state.blendTemplate.calibrate;
+    if (tc) {
+      state.cal.target = tc.target ?? 150;
+      state.cal.tolerance = tc.tolerance ?? 10;
+      state.calBands = {};
+      for (const ob of tc.overlaps || []) {
+        state.calBands[String(ob.between[0])] =
+          ob.samples.map(s => ({ u: s.u, left: s.left, right: s.right }));
+      }
+    } else {
+      state.calBands = {};
+    }
   } else if (!state.blend.segments.length) {
     splitSegmentsEven(2);
   }
@@ -860,9 +935,32 @@ function renderStrip() {
   const xLo = uToX(minU), xHi = uToX(maxU);
   const rowH = 0.62, gap = 0.12;
   const totalH = n * rowH + (n - 1) * gap + 0.3;
+
+  // ---- 校准视图数据 ----
+  const calOk = calResult && !calResult.error && calResult.status === 'ok';
+  const calPrev = calResult && !calResult.error &&
+                  calResult.status === 'no_common_attenuation' ? calResult.preview : null;
+  const calMissing = calResult && !calResult.error &&
+                     calResult.status === 'measurement_missing'
+    ? (calResult.missing || []).map(m => m.between[0]) : [];
+  const bandSamples = {};     // 左机序号 -> 采样行（含 ok 标记）
+  if (calOk) for (const b of calResult.overlaps) bandSamples[b.between[0]] = b.samples;
+  if (calPrev) for (const b of calPrev.overlaps) bandSamples[b.between[0]] = b.samples;
+  const showProfile = calOk || calPrev;
+  const profExtra = showProfile ? 1.25 : 0;
+
   stripSvg.setAttribute('viewBox',
-    `${xLo - STRIP_PAD.l} ${-STRIP_PAD.t} ${xHi - xLo + STRIP_PAD.l + STRIP_PAD.r} ${totalH + STRIP_PAD.t + STRIP_PAD.b}`);
+    `${xLo - STRIP_PAD.l} ${-STRIP_PAD.t} ${xHi - xLo + STRIP_PAD.l + STRIP_PAD.r} ${totalH + profExtra + STRIP_PAD.t + STRIP_PAD.b}`);
   addDefs(stripSvg, 'B');
+  // 校准成立时各重叠带的左机→右机渐变填充
+  if (calOk) {
+    const defs = el('defs', {}, stripSvg);
+    for (let k = 0; k < n - 1; k++) {
+      const grad = el('linearGradient', { id: `bfade${k}`, x1: 0, y1: 0, x2: 1, y2: 0 }, defs);
+      el('stop', { offset: '0%', 'stop-color': devColor(k), 'stop-opacity': 0.5 }, grad);
+      el('stop', { offset: '100%', 'stop-color': devColor(k + 1), 'stop-opacity': 0.5 }, grad);
+    }
+  }
 
   const topY = 0.05;
   // 整幅幕布底衬
@@ -899,20 +997,38 @@ function renderStrip() {
       render();
     });
 
-    // 邻接重叠斜纹
+    // 邻接重叠（融合带）
     if (k < n - 1) {
       const ovA = uToX(segs[k + 1].u0), ovB = uToX(seg.u1);
       const ov = segs[k].u1 - segs[k + 1].u0;
       if (ov > 0) {
         const need = Math.max(seg.min_overlap, segs[k + 1].min_overlap);
+        const ovOk = ov + 1e-6 >= need;
+        const bandY = y + 0.1, bandH = (rowH - 0.2) * 2 + gap;
         el('rect', {
-          x: ovA, y: y + 0.1, width: ovB - ovA, height: (rowH - 0.2) * 2 + gap,
-          fill: ov + 1e-6 >= need ? 'url(#ovhatchB)' : '#e03131',
-          'fill-opacity': ov + 1e-6 >= need ? 1 : 0.35,
+          x: ovA, y: bandY, width: ovB - ovA, height: bandH,
+          fill: calOk ? `url(#bfade${k})` : (ovOk ? 'url(#ovhatchB)' : '#e03131'),
+          'fill-opacity': calOk || ovOk ? 1 : 0.35,
         }, stripSvg);
         textAt(stripSvg, (ovA + ovB) / 2, y + rowH + gap / 2,
-          `重叠 ${fmt(ov)}m${ov + 1e-6 >= need ? '' : ` < ${fmt(need)}`}`, 0.105,
-          ov + 1e-6 >= need ? '#2b8a3e' : '#c92a2a');
+          `重叠 ${fmt(ov)}m${ovOk ? '' : ` < ${fmt(need)}`}`, 0.105,
+          ovOk ? '#2b8a3e' : '#c92a2a');
+        // 校准采样点（绿=达标，红=超差）
+        const rows = bandSamples[k] || [];
+        const cy = bandY + bandH / 2;
+        for (const sm of rows) {
+          const dot = el('circle', {
+            cx: uToX(sm.u), cy, r: 0.05,
+            fill: sm.ok ? '#2b8a3e' : '#e03131',
+            stroke: '#fff', 'stroke-width': 0.015,
+          }, stripSvg);
+          const tt = el('title', {}, dot);
+          tt.textContent = `u=${fmt(sm.u)}m 预测叠加 ${fmt(sm.total, 1)}` +
+            (sm.ok ? '（达标）' : '（超差）');
+        }
+        if (calMissing.includes(k)) {
+          textAt(stripSvg, (ovA + ovB) / 2, cy, '缺采样', 0.11, '#c92a2a');
+        }
       } else if (ov < 0) {
         // 缝隙
         el('rect', { x: ovB, y: y + 0.08, width: ovA - ovB, height: rowH - 0.16, fill: '#e03131', 'fill-opacity': 0.5 }, stripSvg);
@@ -920,9 +1036,11 @@ function renderStrip() {
       }
     }
 
-    // 宽度/区间标注
+    // 宽度/区间标注（校准成立时附衰减值）
+    const attTxt = calOk && calResult.attenuations[k]
+      ? `　衰减 ${fmt(calResult.attenuations[k].value, 3)}` : '';
     textAt(stripSvg, (a + b) / 2, y + rowH / 2 + 0.02,
-      `区间宽 ${fmt(seg.u1 - seg.u0)}m　净距 ${fmt(seg.clearance)}m`, 0.115,
+      `区间宽 ${fmt(seg.u1 - seg.u0)}m　净距 ${fmt(seg.clearance)}m${attTxt}`, 0.115,
       feasible === false ? '#c92a2a' : '#343a40');
     textAt(stripSvg, a, y + rowH + 0.06, fmt(seg.u0), 0.095, '#868e96');
     textAt(stripSvg, b, y + rowH + 0.06, fmt(seg.u1), 0.095, '#868e96');
@@ -952,6 +1070,76 @@ function renderStrip() {
       render();
     });
   });
+
+  // ---- 逐点预测亮度曲线（校准成立或诊断预览时）----
+  if (showProfile) drawCalProfile(xL, xR, xLo, totalH, calOk, calPrev, segs);
+}
+
+function drawCalProfile(xL, xR, xLo, totalH, calOk, calPrev, segs) {
+  const s = state.screen;
+  const T = calResult.target.luminance, tol = calResult.target.tolerance;
+  const profTop = totalH + 0.22, profH = 0.78;
+  // 数据点：ok 时用逐点预测；诊断预览时用各采样叠加值 + 各机非重叠区参考线
+  let pts = [];
+  if (calOk) {
+    pts = calResult.screen_samples.map(p => ({ u: p.u, v: p.luminance, ok: p.ok }));
+  } else {
+    for (const b of calPrev.overlaps) {
+      for (const sm of b.samples) pts.push({ u: sm.u, v: sm.total, ok: sm.ok });
+    }
+  }
+  const levels = calOk
+    ? calResult.attenuations.map(a => ({ device: a.device, v: a.non_overlap_luminance, ok: a.ok }))
+    : calPrev.levels.map(l => ({ device: l.device, v: l.luminance, ok: l.ok }));
+  const allV = [...pts.map(p => p.v), ...levels.map(l => l.v), T - tol, T + tol];
+  const vLo = Math.min(...allV) - Math.max(1, tol * 0.25);
+  const vHi = Math.max(...allV) + Math.max(1, tol * 0.25);
+  const Y = v => profTop + profH - (v - vLo) / (vHi - vLo) * profH;
+
+  textAt(stripSvg, xLo - 0.12, profTop - 0.08, '预测亮度', 0.1, '#495057', 'end');
+  // 目标容差带
+  el('rect', {
+    x: xL, y: Y(T + tol), width: s.width, height: Y(T - tol) - Y(T + tol),
+    fill: 'rgba(47,158,68,0.10)', stroke: 'none',
+  }, stripSvg);
+  for (const [v, lbl] of [[T + tol, `上限 ${fmt(T + tol, 0)}`],
+                          [T, `目标 ${fmt(T, 0)}`],
+                          [T - tol, `下限 ${fmt(T - tol, 0)}`]]) {
+    el('line', {
+      x1: xL, y1: Y(v), x2: xR, y2: Y(v),
+      stroke: v === T ? '#2b8a3e' : '#87c78f',
+      'stroke-width': v === T ? 0.014 : 0.01,
+      'stroke-dasharray': v === T ? 'none' : '0.07 0.05',
+    }, stripSvg);
+    textAt(stripSvg, xLo - 0.1, Y(v), lbl, 0.09, '#2b8a3e', 'end');
+  }
+  // 各机非重叠区参考亮度（虚线段）
+  const n = segs.length;
+  levels.forEach(lv => {
+    const k = lv.device;
+    const loEx = k === 0 ? segs[0].u0 : Math.max(segs[k].u0, segs[k - 1].u1);
+    const hiEx = k === n - 1 ? segs[k].u1 : Math.min(segs[k].u1, segs[k + 1].u0);
+    const a = uToX(Math.max(loEx, 0)), b = uToX(Math.min(hiEx, s.width));
+    if (b - a <= 0.01) return;
+    el('line', {
+      x1: a, y1: Y(lv.v), x2: b, y2: Y(lv.v),
+      stroke: devColor(k), 'stroke-width': 0.02, 'stroke-dasharray': '0.09 0.05',
+      'stroke-opacity': 0.85,
+    }, stripSvg);
+  });
+  // 逐点预测折线与采样点
+  if (calOk && pts.length > 1) {
+    el('polyline', {
+      points: pts.map(p => `${uToX(p.u)},${Y(p.v)}`).join(' '),
+      fill: 'none', stroke: '#1971c2', 'stroke-width': 0.02,
+    }, stripSvg);
+  }
+  for (const p of pts) {
+    el('circle', {
+      cx: uToX(p.u), cy: Y(p.v), r: 0.045,
+      fill: p.ok ? '#2b8a3e' : '#e03131', stroke: '#fff', 'stroke-width': 0.012,
+    }, stripSvg);
+  }
 }
 
 /* ================= 面板：单机方案列表 ================= */
@@ -993,6 +1181,7 @@ function renderSchemeList() {
 function renderBlendList() {
   const ul = document.getElementById('blendList');
   ul.innerHTML = '';
+  const calOk = calResult && !calResult.error && calResult.status === 'ok';
   blendSegs().forEach((seg, k) => {
     const dv = blendDeviceResult(k);
     const li = document.createElement('li');
@@ -1002,6 +1191,9 @@ function renderBlendList() {
       if (!dv.feasible) stTxt = '不可行';
       else if (dv.domain === 'line') stTxt = `安装线 ${fmt(dv.line_length)}m`;
       else stTxt = `${fmt(dv.area)} m²`;
+    }
+    if (calOk && calResult.attenuations[k]) {
+      stTxt += ` · 衰减 ${fmt(calResult.attenuations[k].value, 3)}`;
     }
     const ovTxt = k < blendSegs().length - 1
       ? `重叠 ${fmt(Math.max(0, seg.u1 - blendSegs()[k + 1].u0))}m` : '';
@@ -1168,6 +1360,192 @@ function renderPointInfoBlend() {
   if (btn) btn.addEventListener('click', () => adoptSuggested(true));
 }
 
+/* ================= 面板：画面融合校准（拼接） ================= */
+let calEditorSig = null;          // 校准编辑器结构签名（变化时才重建 DOM，避免输入失焦）
+
+function calStructSig() {
+  const segs = blendSegs();
+  return JSON.stringify([
+    segs.map(s => s.id + ':' + s.scheme.name),
+    segs.slice(0, -1).map((_, k) =>
+      bandRangeOf(k).map(v => v.toFixed(3)).join('-') +
+      ':' + (state.calBands[String(k)] || []).length),
+  ]);
+}
+
+function bandRangeOf(k) {
+  const segs = blendSegs();
+  return [segs[k + 1].u0, segs[k].u1];   // 重叠带 [u0, u1]（幕布坐标）
+}
+
+function buildCalEditors() {
+  const segs = blendSegs();
+  // ---- 逐机测量行 ----
+  const devBox = document.getElementById('calDeviceList');
+  devBox.innerHTML = '<h3>逐机测量（实测基准亮度 · 可调衰减上下限）</h3>';
+  segs.forEach((seg, k) => {
+    const row = document.createElement('div');
+    row.className = 'cal-row';
+    row.innerHTML =
+      `<span class="cal-dev" style="color:${devColor(k)}">${k + 1}号机</span>` +
+      '<label>基准亮度<input type="number" step="1" min="0.01"></label>' +
+      '<label>衰减下限<input type="number" step="0.01" min="0" max="1"></label>' +
+      '<label>衰减上限<input type="number" step="0.01" min="0" max="1"></label>';
+    const [base, lo, hi] = row.querySelectorAll('input');
+    base.dataset.cal = `base:${k}`; lo.dataset.cal = `attMin:${k}`; hi.dataset.cal = `attMax:${k}`;
+    base.addEventListener('input', () => {
+      const v = parseFloat(base.value);
+      if (Number.isFinite(v)) { seg.cal.base = v; onStateChange(); }
+    });
+    lo.addEventListener('input', () => {
+      const v = parseFloat(lo.value);
+      if (Number.isFinite(v)) { seg.cal.attMin = v; onStateChange(); }
+    });
+    hi.addEventListener('input', () => {
+      const v = parseFloat(hi.value);
+      if (Number.isFinite(v)) { seg.cal.attMax = v; onStateChange(); }
+    });
+    devBox.appendChild(row);
+  });
+
+  // ---- 重叠带采样编辑器 ----
+  const bandBox = document.getElementById('calBandList');
+  bandBox.innerHTML = '<h3>重叠带两侧亮度采样（沿幕布坐标）</h3>';
+  for (let k = 0; k < segs.length - 1; k++) {
+    const [u0, u1] = bandRangeOf(k);
+    const wrap = document.createElement('div');
+    wrap.className = 'cal-band';
+    const head = document.createElement('div');
+    head.className = 'cal-band-head';
+    head.innerHTML =
+      `<span style="color:${devColor(k)}">●</span><span style="color:${devColor(k + 1)}">●</span> ` +
+      `重叠带 ${k + 1}（${k + 1}号机↔${k + 2}号机，[${fmt(u0)}, ${fmt(u1)}]m）`;
+    const addBtn = document.createElement('button');
+    addBtn.className = 'mini';
+    addBtn.textContent = '＋ 添加采样点';
+    addBtn.addEventListener('click', () => {
+      const key = String(k);
+      const list = state.calBands[key] = state.calBands[key] || [];
+      const [a, b] = bandRangeOf(k);
+      list.push({ u: (a + b) / 2, left: segs[k].cal.base, right: segs[k + 1].cal.base });
+      onStateChange();
+    });
+    head.appendChild(addBtn);
+    wrap.appendChild(head);
+
+    const samples = state.calBands[String(k)] || [];
+    if (!samples.length) {
+      const p = document.createElement('p');
+      p.className = 'hint warn';
+      p.textContent = '尚未录入采样——该校准带测量缺失，系统不会输出校准结果';
+      wrap.appendChild(p);
+    }
+    samples.forEach((smp, si) => {
+      const row = document.createElement('div');
+      row.className = 'cal-row cal-sample';
+      row.innerHTML =
+        '<label>u (m)<input type="number" step="0.01"></label>' +
+        `<label>${k + 1}号机亮度<input type="number" step="1" min="0"></label>` +
+        `<label>${k + 2}号机亮度<input type="number" step="1" min="0"></label>` +
+        '<button class="mini danger" title="删除该采样点">×</button>';
+      const [iu, il, ir] = row.querySelectorAll('input');
+      iu.dataset.cal = `su:${k}:${si}`; il.dataset.cal = `sl:${k}:${si}`;
+      ir.dataset.cal = `sr:${k}:${si}`;
+      iu.addEventListener('input', () => {
+        const v = parseFloat(iu.value);
+        if (Number.isFinite(v)) { smp.u = v; onStateChange(); }
+      });
+      il.addEventListener('input', () => {
+        const v = parseFloat(il.value);
+        if (Number.isFinite(v)) { smp.left = v; onStateChange(); }
+      });
+      ir.addEventListener('input', () => {
+        const v = parseFloat(ir.value);
+        if (Number.isFinite(v)) { smp.right = v; onStateChange(); }
+      });
+      row.querySelector('button').addEventListener('click', () => {
+        state.calBands[String(k)].splice(si, 1);
+        onStateChange();
+      });
+      wrap.appendChild(row);
+    });
+    bandBox.appendChild(wrap);
+  }
+}
+
+function syncCalInputs() {
+  const segs = blendSegs();
+  document.querySelectorAll('#calCard input[data-cal]').forEach(input => {
+    if (document.activeElement === input) return;
+    const [kind, a, b] = input.dataset.cal.split(':');
+    const k = Number(a);
+    let v = '';
+    if (kind === 'base') v = segs[k] ? segs[k].cal.base : '';
+    else if (kind === 'attMin') v = segs[k] ? segs[k].cal.attMin : '';
+    else if (kind === 'attMax') v = segs[k] ? segs[k].cal.attMax : '';
+    else {
+      const smp = (state.calBands[String(k)] || [])[Number(b)];
+      if (smp) v = kind === 'su' ? smp.u : kind === 'sl' ? smp.left : smp.right;
+    }
+    input.value = v === '' ? '' : fmt(v, kind === 'su' ? 2 : (kind.startsWith('att') ? 2 : 1));
+  });
+}
+
+function renderCalResult() {
+  const box = document.getElementById('calResult');
+  if (!calResult) {
+    box.innerHTML = '<p class="hint">校准计算中…</p>';
+    return;
+  }
+  if (calResult.error) {
+    box.innerHTML = `<div class="diag-box">❌ ${esc(calResult.error)}</div>`;
+    return;
+  }
+  const banners = {
+    ok: ['ok-box', '✅ 校准成立：各机衰减全局一致，非重叠区与重叠带的加权亮度均落入目标容差'],
+    measurement_missing: ['diag-box', '⚠ 测量缺失：请补齐下列重叠带的两侧亮度采样，补齐前不输出校准'],
+    no_common_attenuation: ['diag-box', '❌ 衰减范围无共同解，未输出校准（幕布条带中的红点为超差采样）'],
+    blend_interval_invalid: ['diag-box', '❌ 原拼接覆盖区间不合法，校准未执行'],
+    blend_device_infeasible: ['diag-box', '❌ 原拼接存在设备无可行安装域，校准未执行'],
+    blend_joint_infeasible: ['diag-box', '❌ 原拼接联合约束冲突，校准未执行'],
+    blend_joint_conflict: ['diag-box', '⚠ 当前安装点与拼接联合约束冲突，校准未执行（可先采纳服务器建议点）'],
+  };
+  const [cls, msg] = banners[calResult.status] || ['diag-box', calResult.status];
+  let html = `<div class="${cls}">${msg}</div>`;
+  if (calResult.diagnostics && calResult.diagnostics.length) {
+    html += '<div class="diag-box" style="margin-top:6px"><b>诊断：</b><ul>' +
+      calResult.diagnostics.map(d => `<li>${esc(d)}</li>`).join('') + '</ul></div>';
+  }
+  if (calResult.status === 'ok') {
+    const T = calResult.target;
+    html += `<table class="checks"><tr><td class="cname">设备</td>` +
+      `<td>衰减值（范围）</td><td>基准亮度</td><td>非重叠区亮度 / 目标 ${fmt(T.luminance, 1)}±${fmt(T.tolerance, 1)}</td></tr>`;
+    for (const a of calResult.attenuations) {
+      html += `<tr><td class="ico"><span style="color:${devColor(a.device)};font-weight:700">${a.device + 1}</span></td>` +
+        `<td class="cname"><b>${fmt(a.value, 4)}</b>（${fmt(a.range[0], 2)}–${fmt(a.range[1], 2)}）</td>` +
+        `<td>${fmt(a.base_luminance, 1)}</td><td>${fmt(a.non_overlap_luminance, 1)} ✅</td></tr>`;
+    }
+    html += '</table>';
+    for (const band of calResult.overlaps) {
+      html += `<p class="hint">重叠带 ${band.between[0] + 1}（[${fmt(band.u0)}, ${fmt(band.u1)}]m）` +
+        `渐变权重：左端 左${fmt(band.weights.u0.left, 2)}/右${fmt(band.weights.u0.right, 2)} → ` +
+        `右端 左${fmt(band.weights.u1.left, 2)}/右${fmt(band.weights.u1.right, 2)}，` +
+        `${band.samples.length} 个采样点全部达标 ✅</p>`;
+    }
+  }
+  box.innerHTML = html;
+}
+
+function renderCalPanel() {
+  const sig = calStructSig();
+  if (sig !== calEditorSig) {
+    buildCalEditors();
+    calEditorSig = sig;
+  }
+  syncCalInputs();
+  renderCalResult();
+}
+
 /* ================= 输入绑定 ================= */
 const numBindings = [];
 function bindNum(id, get, set, digits = 2) {
@@ -1283,6 +1661,10 @@ function bindAllInputs() {
     splitSegmentsEven(blendSegs().length);
     onStateChange();
   });
+
+  /* ---- 画面融合校准 ---- */
+  bindNum('calTarget', () => state.cal.target, v => { state.cal.target = v; }, 1);
+  bindNum('calTolerance', () => state.cal.tolerance, v => { state.cal.tolerance = v; }, 1);
 
   /* ---- 拼接设备编辑 ---- */
   bindNum('bschU0', () => B()?.u0, v => { const g = B(); if (g) g.u0 = v; });
@@ -1474,7 +1856,7 @@ function render() {
   }
   renderObstacleList();
   if (state.mode === 'single') renderPointInfoSingle();
-  else renderPointInfoBlend();
+  else { renderPointInfoBlend(); renderCalPanel(); }
   syncInputs();
 }
 
@@ -1489,7 +1871,10 @@ function applyState(data) {
   state.blendTemplate = data.blend || null;
   state.blend.segments = [];
   state.blend.selectedIdx = 0;
+  state.cal = { target: 150, tolerance: 10 };
+  state.calBands = {};
   blendResult = null;
+  calResult = null;
   result = null;
   resultById = {};
   const first = state.schemes[0];

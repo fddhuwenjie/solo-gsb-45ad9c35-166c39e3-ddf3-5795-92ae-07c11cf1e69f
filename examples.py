@@ -88,6 +88,21 @@ EXAMPLES = [
                     {"scheme_idx": 1, "u0": 1.9, "u1": 4.1,
                      "min_overlap": 0.20, "clearance": 0.30},
                 ],
+                # 画面融合校准：目标亮度 140±12，重叠带 [1.9, 2.1]m 三点采样
+                "calibrate": {
+                    "target": 140.0, "tolerance": 12.0,
+                    "devices": [
+                        {"base_luminance": 160.0, "att_min": 0.50, "att_max": 1.0},
+                        {"base_luminance": 175.0, "att_min": 0.50, "att_max": 1.0},
+                    ],
+                    "overlaps": [
+                        {"between": [0, 1], "samples": [
+                            {"u": 1.95, "left": 160.0, "right": 175.0},
+                            {"u": 2.00, "left": 160.0, "right": 175.0},
+                            {"u": 2.05, "left": 160.0, "right": 175.0},
+                        ]},
+                    ],
+                },
             },
         },
     },
@@ -116,6 +131,21 @@ EXAMPLES = [
                     {"scheme_idx": 1, "u0": 2.8, "u1": 6.1,
                      "min_overlap": 0.30, "clearance": 0.30},
                 ],
+                # 画面融合校准：目标亮度 150±12，重叠带 [2.8, 3.1]m 三点采样
+                "calibrate": {
+                    "target": 150.0, "tolerance": 12.0,
+                    "devices": [
+                        {"base_luminance": 165.0, "att_min": 0.60, "att_max": 1.0},
+                        {"base_luminance": 158.0, "att_min": 0.60, "att_max": 1.0},
+                    ],
+                    "overlaps": [
+                        {"between": [0, 1], "samples": [
+                            {"u": 2.85, "left": 165.0, "right": 157.0},
+                            {"u": 2.95, "left": 164.0, "right": 158.0},
+                            {"u": 3.05, "left": 163.0, "right": 159.0},
+                        ]},
+                    ],
+                },
             },
         },
     },
@@ -146,6 +176,27 @@ EXAMPLES = [
                     {"scheme_idx": 0, "u0": 6.1, "u1": 9.1,
                      "min_overlap": 0.25, "clearance": 0.35},
                 ],
+                # 画面融合校准：目标亮度 150±14，两条重叠带各三点采样
+                "calibrate": {
+                    "target": 150.0, "tolerance": 14.0,
+                    "devices": [
+                        {"base_luminance": 170.0, "att_min": 0.60, "att_max": 1.0},
+                        {"base_luminance": 172.0, "att_min": 0.60, "att_max": 1.0},
+                        {"base_luminance": 168.0, "att_min": 0.60, "att_max": 1.0},
+                    ],
+                    "overlaps": [
+                        {"between": [0, 1], "samples": [
+                            {"u": 3.05, "left": 170.0, "right": 172.0},
+                            {"u": 3.125, "left": 170.0, "right": 172.0},
+                            {"u": 3.20, "left": 170.0, "right": 172.0},
+                        ]},
+                        {"between": [1, 2], "samples": [
+                            {"u": 6.15, "left": 172.0, "right": 168.0},
+                            {"u": 6.225, "left": 172.0, "right": 168.0},
+                            {"u": 6.30, "left": 172.0, "right": 168.0},
+                        ]},
+                    ],
+                },
             },
         },
     },

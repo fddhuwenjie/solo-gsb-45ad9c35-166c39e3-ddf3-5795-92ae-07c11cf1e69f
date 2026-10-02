@@ -20,6 +20,8 @@
 覆盖时才给出避障无解诊断。
 """
 
+import math
+
 EPS = 1e-9
 
 
@@ -796,3 +798,459 @@ def compute_blend(room, screen, segments, obstacles, points=None, lens_heights=N
         "point_conflicts": point_conflicts,
         "diagnostics": joint_diags,
     }
+
+
+# ==========================================================================
+# 画面融合校准
+#
+# 在 /api/blend 联合求解成立（覆盖连续、逐机可行、联合安装成立）后，
+# 为每台投影机选择一个全局一致的衰减值 att_k ∈ [att_min_k, att_max_k]：
+#   非重叠区：亮度 = base_k · att_k 须落入 [T−tol, T+tol]
+#     → 每台得衰减窗口 win_k = [att_min, att_max] ∩ [(T−tol)/base, (T+tol)/base]
+#   重叠带 k（设备 k 与 k+1 之间 [u0,u1]）：权重从带左端 (左1, 右0) 到带右端
+#     (左0, 右1) 单调线性渐变，采样点 u 处 t=(u−u0)/(u1−u0)，叠加亮度
+#       B(u) = m_l·att_k·(1−t) + m_r·att_{k+1}·t  同样须落入 [T−tol, T+tol]
+# 同一台设备参与两侧重叠时，其衰减值同时出现在两个重叠带的约束中。
+#
+# 全部约束都是关于衰减值的线性不等式，可行域是有界凸多面体（衰减有上下界）。
+# n≤3 时按重叠带分解为若干二维问题精确求解：每个重叠带的约束只涉及
+# (att_k, att_{k+1})，可行集为二维凸多边形；有界多面体非空 ⟺ 存在可行顶点，
+# 顶点必为某两条约束边界线的交点，枚举即可。三机两带时，联合可行 ⟺ 两个
+# 多边形在中间设备衰减轴上的投影相交（投影均为区间）。
+#
+# 解不唯一时取确定性规则：优先采用“全局一致的最小衰减”
+# g0 = max(各窗口下限)（所有设备取同一值、画面尽量亮）；g0 不可行时取
+# 离 (g0,…,g0) 最近的可行点。全程无随机、无迭代初值，输出确定。
+# ==========================================================================
+
+CAL_MAX_SAMPLES = 64        # 每个重叠带允许的最大采样点数
+_CAL_VERT_EPS = 1e-7        # 顶点可行性判定的数值余量
+
+
+def _att_window(base, att_lo, att_hi, target, tol):
+    """单机衰减窗口：att ∈ [att_lo,att_hi] 且 base·att ∈ [T−tol,T+tol]。"""
+    return (max(att_lo, (target - tol) / base),
+            min(att_hi, (target + tol) / base))
+
+
+def _poly_from_constraints(cons):
+    """二维线性不等式组 a·x+b·y ≤ c 的可行凸多边形顶点（绕质心角序）。
+
+    调用方保证变量有上下界（可行域有界）。有界多面体非空 ⟺ 存在可行顶点，
+    顶点必为两条非平行边界线的交点；无可行顶点即空可行域，返回 []。
+    """
+    verts = []
+    m = len(cons)
+    for i in range(m):
+        a1, b1, c1 = cons[i]
+        for j in range(i + 1, m):
+            a2, b2, c2 = cons[j]
+            det = a1 * b2 - a2 * b1
+            if abs(det) <= 1e-12:
+                continue
+            x = (c1 * b2 - c2 * b1) / det
+            y = (a1 * c2 - a2 * c1) / det
+            if all(a * x + b * y <= c + _CAL_VERT_EPS for a, b, c in cons):
+                if not any(abs(x - ux) <= 1e-9 and abs(y - uy) <= 1e-9
+                           for ux, uy in verts):
+                    verts.append((x, y))
+    if not verts:
+        return []
+    cx = sum(p[0] for p in verts) / len(verts)
+    cy = sum(p[1] for p in verts) / len(verts)
+    verts.sort(key=lambda p: (math.atan2(p[1] - cy, p[0] - cx),
+                              (p[0] - cx) ** 2 + (p[1] - cy) ** 2))
+    return verts
+
+
+def _poly_range(poly, axis):
+    """多边形顶点在指定坐标轴（0=x, 1=y）上的投影区间。"""
+    vals = [p[axis] for p in poly]
+    return (min(vals), max(vals))
+
+
+def _poly_section(poly, axis, v):
+    """多边形与直线 axis=v 的交集在另一轴上的区间；为空返回 None。"""
+    out = []
+    m = len(poly)
+    for i in range(m):
+        p, q = poly[i], poly[(i + 1) % m]
+        dp, dq = p[axis] - v, q[axis] - v
+        if abs(dp) <= 1e-12 and abs(dq) <= 1e-12:
+            out.extend((p[1 - axis], q[1 - axis]))
+        elif dp * dq <= 0 and abs(q[axis] - p[axis]) > 1e-12:
+            t = (v - p[axis]) / (q[axis] - p[axis])
+            out.append(p[1 - axis] + t * (q[1 - axis] - p[1 - axis]))
+    if not out:
+        return None
+    return (min(out), max(out))
+
+
+def _seg_closest(x1, y1, x2, y2, px, py):
+    """线段上离 (px,py) 最近的点。"""
+    dx, dy = x2 - x1, y2 - y1
+    ll = dx * dx + dy * dy
+    if ll <= 1e-24:
+        return (x1, y1)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / ll))
+    return (x1 + t * dx, y1 + t * dy)
+
+
+def _poly_closest(poly, gx, gy):
+    """凸多边形（顶点角序）内离 (gx,gy) 最近的点；等距时取先扫描到者。"""
+    m = len(poly)
+    if m <= 2:
+        # 退化为点或线段：角序内外判定不适用，直接取线段最近点
+        best, best_d = None, None
+        for i in range(m):
+            p, q = poly[i], poly[(i + 1) % m]
+            c = _seg_closest(p[0], p[1], q[0], q[1], gx, gy)
+            d = (c[0] - gx) ** 2 + (c[1] - gy) ** 2
+            if best is None or d < best_d - 1e-18:
+                best, best_d = c, d
+        return best
+    if all((q[0] - p[0]) * (gy - p[1]) - (q[1] - p[1]) * (gx - p[0]) >= -1e-12
+           for p, q in ((poly[i], poly[(i + 1) % m]) for i in range(m))):
+        return (gx, gy)
+    best, best_d = None, None
+    for i in range(m):
+        p, q = poly[i], poly[(i + 1) % m]
+        c = _seg_closest(p[0], p[1], q[0], q[1], gx, gy)
+        d = (c[0] - gx) ** 2 + (c[1] - gy) ** 2
+        if best is None or d < best_d - 1e-18:
+            best, best_d = c, d
+    return best
+
+
+def _band_constraints(band, win_k, win_k1, target, tol):
+    """重叠带关于 (att_k, att_{k+1}) 的线性约束（含两台各自的衰减窗口）。"""
+    cons = [(1.0, 0.0, win_k[1]), (-1.0, 0.0, -win_k[0]),
+            (0.0, 1.0, win_k1[1]), (0.0, -1.0, -win_k1[0])]
+    for s in band["samples"]:
+        cl = s["left"] * (1.0 - s["t"])
+        cr = s["right"] * s["t"]
+        cons.append((cl, cr, target + tol))
+        cons.append((-cl, -cr, -(target - tol)))
+    return cons
+
+
+def _solve_attenuations(devs_cal, bands, target, tol):
+    """联合衰减求解。
+
+    devs_cal: [{"base", "att_lo", "att_hi", "win": (lo, hi)}] × N
+    bands:    [{"k", "u0", "u1", "samples": [{"u","t","left","right"}]}]
+              k 为重叠带左侧设备编号
+    返回 (atts 或 None, detail)；atts 为每台一个全局一致的衰减值。
+    """
+    n = len(devs_cal)
+    g0 = max(d["win"][0] for d in devs_cal)      # 全局一致的最小衰减
+    g1 = min(d["win"][1] for d in devs_cal)
+    if g0 > g1 + EPS:
+        return None, {"case": "windows"}
+
+    polys = {}
+    for band in bands:
+        k = band["k"]
+        cons = _band_constraints(band, devs_cal[k]["win"], devs_cal[k + 1]["win"],
+                                 target, tol)
+        polys[k] = _poly_from_constraints(cons)
+        if not polys[k]:
+            return None, {"case": "band", "band": k}
+
+    if not bands:
+        return [g0] * n, {"case": "ok"}
+
+    if n == 2:
+        x, y = _poly_closest(polys[0], g0, g0)
+        return [x, y], {"case": "ok"}
+
+    # n == 3：带 0 约束 (att_1, att_2)，带 1 约束 (att_2, att_3)
+    atts = [g0, g0, g0]
+    if 0 in polys and 1 in polys:
+        ya = _poly_range(polys[0], 1)       # att_2 在左侧重叠带的可行区间
+        xa = _poly_range(polys[1], 0)       # att_2 在右侧重叠带的可行区间
+        lo, hi = max(ya[0], xa[0]), min(ya[1], xa[1])
+        if lo > hi + EPS:
+            return None, {"case": "shared", "left": ya, "right": xa}
+        a2 = min(max(g0, lo), hi)
+        sec_l = _poly_section(polys[0], 1, a2)      # att_1 的可行区间
+        sec_r = _poly_section(polys[1], 0, a2)      # att_3 的可行区间
+        atts = [min(max(g0, sec_l[0]), sec_l[1]), a2,
+                min(max(g0, sec_r[0]), sec_r[1])]
+    elif 0 in polys:
+        x, y = _poly_closest(polys[0], g0, g0)
+        atts = [x, y, min(max(g0, devs_cal[2]["win"][0]), devs_cal[2]["win"][1])]
+    else:
+        x, y = _poly_closest(polys[1], g0, g0)
+        atts = [min(max(g0, devs_cal[0]["win"][0]), devs_cal[0]["win"][1]), x, y]
+    return atts, {"case": "ok"}
+
+
+def _sample_reach(s, win_k, win_k1):
+    """采样点在各自衰减窗口内可达的叠加亮度区间（双线性，极值在角点）。"""
+    vals = [s["left"] * (1.0 - s["t"]) * ak + s["right"] * s["t"] * ak1
+            for ak in win_k for ak1 in win_k1]
+    return (min(vals), max(vals))
+
+
+def _cal_failure_diags(detail, devs_cal, bands, target, tol):
+    """衰减无解时按设备/重叠带定位的诊断。"""
+    diags = []
+    if detail["case"] == "windows":
+        for k, d in enumerate(devs_cal):
+            empty = d["win"][0] > d["win"][1] + EPS
+            diags.append(
+                f"设备 {k + 1}：基准亮度 {d['base']:.1f}，可调衰减 "
+                f"[{d['att_lo']:.2f}, {d['att_hi']:.2f}]，满足非重叠区目标 "
+                f"{target:.1f}±{tol:.1f} 的衰减窗口为 "
+                f"[{d['win'][0]:.4f}, {d['win'][1]:.4f}]" +
+                ("（空窗口：即使" +
+                 ("完全衰减仍过亮" if d["win"][1] < d["att_lo"] else "不衰减仍过暗") +
+                 "）" if empty else ""))
+        kmax = max(range(len(devs_cal)), key=lambda k: devs_cal[k]["win"][0])
+        kmin = min(range(len(devs_cal)), key=lambda k: devs_cal[k]["win"][1])
+        if kmax == kmin:
+            diags.append(
+                f"衰减范围无共同解：设备 {kmax + 1} 的衰减窗口本身为空（需同时 ≥ "
+                f"{devs_cal[kmax]['win'][0]:.4f} 且 ≤ {devs_cal[kmax]['win'][1]:.4f}）"
+                f"——请放宽该机的可调衰减上下限、复测基准亮度，或调整目标亮度/容差")
+        else:
+            diags.append(
+                f"衰减范围无共同解：设备 {kmax + 1} 的衰减需 ≥ "
+                f"{devs_cal[kmax]['win'][0]:.4f}，而设备 {kmin + 1} 的衰减需 ≤ "
+                f"{devs_cal[kmin]['win'][1]:.4f}，公共区间为空——请放宽可调衰减"
+                f"上下限、复测基准亮度，或调整目标亮度/容差")
+    elif detail["case"] == "band":
+        k = detail["band"]
+        band = next(b for b in bands if b["k"] == k)
+        diags.append(
+            f"重叠带 {k + 1}（设备 {k + 1}↔{k + 2}，幕布坐标 "
+            f"[{band['u0']:.2f}, {band['u1']:.2f}]m）：不存在同时满足该带全部"
+            f"采样的衰减组合")
+        impossible = []
+        for s in band["samples"]:
+            lo_s, hi_s = _sample_reach(s, devs_cal[k]["win"], devs_cal[k + 1]["win"])
+            if lo_s > target + tol + _CAL_VERT_EPS or \
+                    hi_s < target - tol - _CAL_VERT_EPS:
+                impossible.append((s, lo_s, hi_s))
+        for s, lo_s, hi_s in impossible[:4]:
+            diags.append(
+                f"　采样 u={s['u']:.2f}m：实测左 {s['left']:.1f} / 右 "
+                f"{s['right']:.1f}，在两侧衰减窗口内可达亮度 "
+                f"[{lo_s:.1f}, {hi_s:.1f}]，与目标区间 "
+                f"[{target - tol:.1f}, {target + tol:.1f}] 无交集")
+        if not impossible:
+            diags.append(
+                "　各采样单独均可达目标区间，但采样间相互冲突：同一对衰减值"
+                "无法同时满足该带全部采样，请复核采样或加大容差")
+    else:  # shared：中间设备的两侧投影不相交
+        ya, yb = detail["left"], detail["right"]
+        diags.append(
+            f"设备 2 同时参与左右两侧重叠：左侧重叠带（设备 1↔2）要求其衰减 ∈ "
+            f"[{ya[0]:.4f}, {ya[1]:.4f}]，右侧重叠带（设备 2↔3）要求 ∈ "
+            f"[{yb[0]:.4f}, {yb[1]:.4f}]，两区间无交集——同一台设备的衰减值"
+            f"无法同时满足两侧重叠带，请复测采样或调整衰减范围/容差")
+    return diags
+
+
+def _eval_band_samples(band, atts, target, tol):
+    """按给定衰减逐采样点计算加权亮度（输出用，数值保留 4 位小数）。"""
+    k = band["k"]
+    rows = []
+    for s in band["samples"]:
+        t = s["t"]
+        wl, wr = 1.0 - t, t
+        lb = s["left"] * atts[k] * wl
+        rb = s["right"] * atts[k + 1] * wr
+        tot = lb + rb
+        rows.append({
+            "u": round(s["u"], 4), "t": round(t, 4),
+            "w_left": round(wl, 4), "w_right": round(wr, 4),
+            "measured_left": round(s["left"], 4),
+            "measured_right": round(s["right"], 4),
+            "left": round(lb, 4), "right": round(rb, 4),
+            "total": round(tot, 4),
+            "deviation": round(tot - target, 4),
+            "ok": abs(tot - target) <= tol + 1e-6,
+        })
+    return rows
+
+
+def compute_calibrate(room, screen, segments, obstacles, points, lens_heights,
+                      cal):
+    """画面融合校准联合求解（以 /api/blend 联合成立为前提）。
+
+    cal = {
+      "target":  {"luminance": >0, "tolerance": >=0},
+      "devices": [{"base_luminance": >0, "att_min", "att_max"}] × N,
+      "overlaps": [{"between": [k, k+1],
+                    "samples": [{"u", "left", "right"}, …]}],
+    }
+    仅在覆盖连续、各设备可行且联合安装成立（blend status == "ok"）时计算；
+    测量缺失、衰减无共同解或原拼接无解时整体返回带设备/重叠定位的诊断，
+    不输出部分校准（失败时 preview 仅为诊断参考，不是可应用的校准方案）。
+    """
+    n = len(segments)
+    target = float(cal["target"]["luminance"])
+    tol = float(cal["target"].get("tolerance", 0.0))
+    devices = cal["devices"]
+
+    # ---- 原拼接联合求解（沿用 /api/blend 的结果与诊断）----
+    blend = compute_blend(room, screen, segments, obstacles, points, lens_heights)
+    resp = {
+        "count": n,
+        "blend_status": blend["status"],
+        "target": {"luminance": round(target, 4), "tolerance": round(tol, 4)},
+    }
+    if blend["status"] != "ok":
+        status_map = {
+            "interval_invalid": "blend_interval_invalid",
+            "device_infeasible": "blend_device_infeasible",
+            "joint_infeasible": "blend_joint_infeasible",
+            "joint_conflict": "blend_joint_conflict",
+        }
+        diags = ["原拼接规划未成立，画面融合校准未执行（先解决拼接问题）"]
+        diags.extend(blend["diagnostics"])
+        diags.extend(c["message"] for c in blend.get("point_conflicts", []))
+        resp.update({
+            "status": status_map.get(blend["status"], "blend_" + blend["status"]),
+            "calibrated": False,
+            "diagnostics": diags,
+        })
+        return resp
+
+    # ---- 重叠带几何（由覆盖区间推导，与 /api/blend 的重叠口径一致）----
+    ub = [(float(s["scheme"]["u0"]), float(s["scheme"]["u1"])) for s in segments]
+    band_geo = {}
+    for k in range(n - 1):
+        if ub[k][1] - ub[k + 1][0] > EPS:
+            band_geo[k] = (ub[k + 1][0], ub[k][1])
+
+    # ---- 测量完整性：每个实际存在的重叠带都必须有两侧亮度采样 ----
+    band_in = {}
+    for b in cal.get("overlaps", []):
+        band_in[int(b["between"][0])] = b
+    diags = []
+    missing = []
+    bands = []
+    for k in sorted(band_geo):
+        u0, u1 = band_geo[k]
+        b = band_in.get(k)
+        samples = (b or {}).get("samples") or []
+        if not samples:
+            missing.append({"type": "overlap", "between": [k, k + 1],
+                            "u0": round(u0, 4), "u1": round(u1, 4)})
+            diags.append(
+                f"重叠带 {k + 1}（设备 {k + 1}↔{k + 2}，幕布坐标 "
+                f"[{u0:.2f}, {u1:.2f}]m）缺少沿幕布坐标的两侧亮度采样")
+            continue
+        ss = sorted(((float(s["u"]), float(s["left"]), float(s["right"]))
+                     for s in samples), key=lambda r: r[0])
+        bands.append({
+            "k": k, "u0": u0, "u1": u1,
+            "samples": [{"u": u,
+                         "t": min(1.0, max(0.0, (u - u0) / (u1 - u0))),
+                         "left": l, "right": r} for u, l, r in ss],
+        })
+    if diags:
+        resp.update({"status": "measurement_missing", "calibrated": False,
+                     "missing": missing, "diagnostics": diags})
+        return resp
+
+    # ---- 逐机衰减窗口 ----
+    devs_cal = []
+    for d in devices:
+        base = float(d["base_luminance"])
+        att_lo, att_hi = float(d["att_min"]), float(d["att_max"])
+        devs_cal.append({"base": base, "att_lo": att_lo, "att_hi": att_hi,
+                         "win": _att_window(base, att_lo, att_hi, target, tol)})
+    windows_info = [{
+        "device": k,
+        "base_luminance": round(d["base"], 4),
+        "range": [round(d["att_lo"], 4), round(d["att_hi"], 4)],
+        "window": [round(d["win"][0], 4), round(d["win"][1], 4)],
+    } for k, d in enumerate(devs_cal)]
+
+    # ---- 联合衰减求解 ----
+    atts, detail = _solve_attenuations(devs_cal, bands, target, tol)
+    if atts is None:
+        # 诊断参考：全局一致最小衰减（越界设备夹到自身边界）下的逐点预测
+        g0 = max(d["win"][0] for d in devs_cal)
+        ref = [min(max(g0, d["att_lo"]), d["att_hi"]) for d in devs_cal]
+        preview = {
+            "attenuations": [round(a, 4) for a in ref],
+            "levels": [{"device": k,
+                        "luminance": round(devs_cal[k]["base"] * ref[k], 4),
+                        "ok": abs(devs_cal[k]["base"] * ref[k] - target)
+                              <= tol + 1e-6}
+                       for k in range(n)],
+            "overlaps": [{
+                "between": [band["k"], band["k"] + 1],
+                "u0": round(band["u0"], 4), "u1": round(band["u1"], 4),
+                "samples": _eval_band_samples(band, ref, target, tol),
+            } for band in bands],
+        }
+        resp.update({
+            "status": "no_common_attenuation", "calibrated": False,
+            "windows": windows_info, "preview": preview,
+            "diagnostics": _cal_failure_diags(detail, devs_cal, bands,
+                                              target, tol),
+        })
+        return resp
+
+    # ---- 成功：确定性输出（衰减值、重叠端点权重、逐点预测亮度）----
+    att_out = [{
+        "device": k,
+        "value": round(atts[k], 4),
+        "range": [round(devs_cal[k]["att_lo"], 4),
+                  round(devs_cal[k]["att_hi"], 4)],
+        "base_luminance": round(devs_cal[k]["base"], 4),
+        "window": [round(devs_cal[k]["win"][0], 4),
+                   round(devs_cal[k]["win"][1], 4)],
+        "non_overlap_luminance": round(devs_cal[k]["base"] * atts[k], 4),
+        "ok": True,
+    } for k in range(n)]
+
+    out_bands = [{
+        "between": [band["k"], band["k"] + 1],
+        "u0": round(band["u0"], 4), "u1": round(band["u1"], 4),
+        "weights": {"u0": {"left": 1.0, "right": 0.0},
+                    "u1": {"left": 0.0, "right": 1.0}},
+        "samples": _eval_band_samples(band, atts, target, tol),
+    } for band in bands]
+
+    # 逐点预测亮度：非重叠区取该台衰减后基准亮度（每区左/中/右三点），
+    # 重叠带内取各实测采样点的加权叠加值
+    screen_pts = []
+    sw = screen["width"]
+    for k in range(n):
+        lo_ex = ub[k][0] if k == 0 else max(ub[k][0], ub[k - 1][1])
+        hi_ex = ub[k][1] if k == n - 1 else min(ub[k][1], ub[k + 1][0])
+        a, b = max(lo_ex, 0.0), min(hi_ex, sw)
+        if b - a > EPS:
+            level = devs_cal[k]["base"] * atts[k]
+            for u in (a, (a + b) / 2.0, b):
+                screen_pts.append({
+                    "u": round(u, 4), "luminance": round(level, 4),
+                    "device": k, "overlap": None,
+                    "ok": abs(level - target) <= tol + 1e-6,
+                })
+    for band, out in zip(bands, out_bands):
+        for row in out["samples"]:
+            screen_pts.append({
+                "u": row["u"], "luminance": row["total"],
+                "device": None, "overlap": band["k"],
+                "w_left": row["w_left"], "w_right": row["w_right"],
+                "ok": row["ok"],
+            })
+    screen_pts.sort(key=lambda p: (p["u"], p["overlap"] is None))
+
+    resp.update({
+        "status": "ok",
+        "calibrated": True,
+        "attenuations": att_out,
+        "overlaps": out_bands,
+        "screen_samples": screen_pts,
+        "diagnostics": [],
+    })
+    return resp

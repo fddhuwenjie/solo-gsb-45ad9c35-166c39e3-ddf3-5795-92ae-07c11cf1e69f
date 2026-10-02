@@ -114,6 +114,18 @@
       <p class="hint" id="bschHint"></p>
     </section>
 
+    <section class="card mode-blend" id="calCard" hidden>
+      <h2>画面融合校准</h2>
+      <div class="form-grid">
+        <label>目标亮度<input type="number" id="calTarget" step="1" min="1"></label>
+        <label>亮度容差 ±<input type="number" id="calTolerance" step="1" min="0"></label>
+      </div>
+      <p class="hint">为每台录入实测基准亮度与可调衰减上下限，并为每个重叠带录入沿幕布坐标的两侧亮度采样；系统仅在拼接联合成立且测量完整时给出全局一致的衰减与渐变权重。</p>
+      <div id="calDeviceList"></div>
+      <div id="calBandList"></div>
+      <div id="calResult"></div>
+    </section>
+
     <section class="card">
       <h2>禁装区（顶视图）</h2>
       <ul id="obstacleList" class="obstacle-list"></ul>
@@ -133,7 +145,7 @@
       <svg id="sideView" preserveAspectRatio="xMidYMid meet"></svg>
     </div>
     <div class="view-box mode-blend" id="stripBox" hidden>
-      <h2>幕布条带（从左到右有序覆盖 · 拖动三角手柄调整区间端点 · 斜纹区为邻接重叠）</h2>
+      <h2>幕布条带（从左到右有序覆盖 · 拖动三角手柄调整区间端点 · 斜纹/渐变区为融合带 · 圆点为重叠带采样 · 底部为逐点预测亮度）</h2>
       <svg id="stripView" preserveAspectRatio="xMidYMid meet"></svg>
     </div>
   </section>
