@@ -117,6 +117,24 @@ EXAMPLES = [
                      "min_overlap": 0.30, "clearance": 0.30},
                 ],
             },
+            # 画面融合校准：目标 255±15 cd/m²；融合带 [2.8,3.1] 沿幕布
+            # 坐标 5 个左右单侧亮度采样（边缘轻微滚降）
+            "calibration": {
+                "target": {"luminance": 255, "tolerance": 15},
+                "devices": [
+                    {"base_luminance": 300, "attenuation_min": 0.70,
+                     "attenuation_max": 1.00},
+                    {"base_luminance": 300, "attenuation_min": 0.70,
+                     "attenuation_max": 1.00},
+                ],
+                "overlap_samples": [
+                    [{"u": 2.85, "left": 299.4, "right": 286.1},
+                     {"u": 2.90, "left": 297.8, "right": 291.1},
+                     {"u": 2.95, "left": 295.0, "right": 295.0},
+                     {"u": 3.00, "left": 291.1, "right": 297.8},
+                     {"u": 3.05, "left": 286.1, "right": 299.4}],
+                ],
+            },
         },
     },
     {
@@ -145,6 +163,30 @@ EXAMPLES = [
                      "min_overlap": 0.25, "clearance": 0.35},
                     {"scheme_idx": 0, "u0": 6.1, "u1": 9.1,
                      "min_overlap": 0.25, "clearance": 0.35},
+                ],
+            },
+            # 画面融合校准：中机以同一个衰减同时满足左右两个融合带
+            "calibration": {
+                "target": {"luminance": 255, "tolerance": 15},
+                "devices": [
+                    {"base_luminance": 300, "attenuation_min": 0.70,
+                     "attenuation_max": 1.00},
+                    {"base_luminance": 300, "attenuation_min": 0.70,
+                     "attenuation_max": 1.00},
+                    {"base_luminance": 300, "attenuation_min": 0.70,
+                     "attenuation_max": 1.00},
+                ],
+                "overlap_samples": [
+                    [{"u": 3.0417, "left": 299.4, "right": 286.1},
+                     {"u": 3.0833, "left": 297.8, "right": 291.1},
+                     {"u": 3.125, "left": 295.0, "right": 295.0},
+                     {"u": 3.1667, "left": 291.1, "right": 297.8},
+                     {"u": 3.2083, "left": 286.1, "right": 299.4}],
+                    [{"u": 6.1417, "left": 299.4, "right": 286.1},
+                     {"u": 6.1833, "left": 297.8, "right": 291.1},
+                     {"u": 6.225, "left": 295.0, "right": 295.0},
+                     {"u": 6.2667, "left": 291.1, "right": 297.8},
+                     {"u": 6.3083, "left": 286.1, "right": 299.4}],
                 ],
             },
         },

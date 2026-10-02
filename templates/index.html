@@ -89,6 +89,17 @@
       <p class="hint">把整幅幕布划成 2~3 个从左到右的有序覆盖区间；区间宽度替代整幅幕宽参与投射比计算，区间中心决定水平位移。可在下方「幕布条带」拖动分区端点，也可直接改端点数值。</p>
     </section>
 
+    <section class="card mode-blend" id="calSwitchCard" hidden>
+      <h2>画面融合校准（亮度）</h2>
+      <label class="chk"><input type="checkbox" id="calEnabled"> 启用画面融合校准</label>
+      <p class="hint">几何拼接成立后，为每台求全局一致衰减、为每个重叠带求从左机到右机的单调渐变权重，使非重叠区与融合带的加权预测亮度全部落入目标容差。</p>
+      <div class="form-grid" id="calTargetGrid" hidden>
+        <label>目标亮度 (cd/m²)<input type="number" id="calTarget" step="1" min="1"></label>
+        <label>容差 ± (cd/m²)<input type="number" id="calTol" step="1" min="0"></label>
+      </div>
+      <button id="calSamplesBtn" class="wide" hidden title="按当前各重叠带坐标与基准亮度生成 5 个均匀采样（可随后编辑实测值）">✦ 生成/重置默认采样</button>
+    </section>
+
     <section class="card mode-blend" hidden>
       <h2>拼接设备（按从左到右顺序）</h2>
       <ul id="blendList" class="scheme-list"></ul>
@@ -102,6 +113,9 @@
         <label>区间终点 u1 (m)<input type="number" id="bschU1" step="0.05"></label>
         <label>最小拼接重叠 (m)<input type="number" id="bschOverlap" step="0.05" min="0" max="6"></label>
         <label>机身检修净距 (m)<input type="number" id="bschClearance" step="0.05" min="0" max="2"></label>
+        <label>实测基准亮度 (cd/m²)<input type="number" id="bschBaseLum" step="1" min="1"></label>
+        <label>衰减下限 (0~1)<input type="number" id="bschAttMin" step="0.01" min="0" max="1"></label>
+        <label>衰减上限 (0~1)<input type="number" id="bschAttMax" step="0.01" min="0" max="1"></label>
         <label>投射比下限<input type="number" id="bschTrMin" step="0.05" min="0.1" max="10"></label>
         <label>投射比上限<input type="number" id="bschTrMax" step="0.05" min="0.1" max="10"></label>
         <label>水平位移 ±%<input type="number" id="bschHShift" step="5" min="0" max="150"></label>
@@ -112,6 +126,13 @@
         <label>镜头高度 (m)<input type="number" id="bschLensZ" step="0.01" min="0" max="10"></label>
       </div>
       <p class="hint" id="bschHint"></p>
+      <p class="hint">衰减 = 输出保留系数，1.0=不衰减、越小衰减越多；同一台参与左右两个融合带时只取一个衰减值，两侧同时满足。</p>
+    </section>
+
+    <section class="card mode-blend" id="calSamplesCard" hidden>
+      <h2>重叠带两侧亮度采样（沿幕布坐标）</h2>
+      <div id="calSamplesBox"></div>
+      <p class="hint">每个融合带至少 2 个严格递增的采样点；<b>左</b>=左机单侧实测亮度、<b>右</b>=右机单侧实测亮度（cd/m²）。端点权重固定为左 (1,0)、右 (0,1)。</p>
     </section>
 
     <section class="card">
